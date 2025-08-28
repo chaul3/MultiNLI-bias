@@ -31,6 +31,8 @@ Standard training with cross-entropy loss - serves as the baseline for compariso
 - **Group-wise evaluation** for bias analysis
 - **Apple Silicon (MPS) GPU support** for faster training
 - **Comprehensive comparison** of all methods
+- **Checkpoint saving** for worst-case model preservation
+- **Resume training** from interrupted sessions
 
 ## Quick Start
 
@@ -45,6 +47,16 @@ pip install -r requirements.txt
 **ERM Baseline:**
 ```bash
 python multinli_erm_baseline.py --epochs 5
+```
+
+**ERM with checkpoint saving:**
+```bash
+python multinli_erm_baseline.py --epochs 5 --save_checkpoints
+```
+
+**Resume from checkpoint:**
+```bash
+python multinli_erm_baseline.py --resume_from model_checkpoints/erm_model_best_checkpoint.pt --save_checkpoints
 ```
 
 **Last Layer Retraining:**
@@ -62,6 +74,11 @@ python just_train_twice.py --phase1_epochs 3 --phase2_epochs 5 --worst_fraction 
 python self_adaptive_training.py --epochs 5
 ```
 
+**SELF with checkpoints:**
+```bash
+python self_adaptive_training.py --epochs 5 --save_checkpoints
+```
+
 ### Compare All Methods
 
 **Run all methods and compare (takes several hours):**
@@ -72,6 +89,44 @@ python compare_methods.py --run_all --epochs 3
 **Compare existing results only:**
 ```bash
 python compare_methods.py --compare_only
+```
+
+## Checkpoint Functionality
+
+### Automatic Best Model Saving
+All methods support checkpoint saving that automatically preserves the model with the best worst-group accuracy:
+
+```bash
+# Enable checkpoint saving (saves best model automatically)
+python multinli_erm_baseline.py --save_checkpoints --epochs 10
+
+# Resume from best checkpoint
+python multinli_erm_baseline.py --resume_from multinli_erm_model/checkpoints/erm_model_best_checkpoint.pt --save_checkpoints
+```
+
+### What Gets Saved
+- **Model state**: Complete model weights
+- **Optimizer state**: For exact training resume
+- **Scheduler state**: Learning rate schedule
+- **Training metrics**: Loss and accuracy history
+- **Best performance**: Tracks best worst-group accuracy
+- **Group statistics**: Per-group performance over time
+
+### Checkpoint Files
+```
+model_name/checkpoints/
+├── erm_model_best_checkpoint.pt       # Best model (highest worst-group accuracy)
+├── erm_model_training_history.json    # Training metrics and progress
+└── erm_model_epoch_N_checkpoint.pt    # Periodic checkpoints (if enabled)
+```
+
+### Quick Demo
+```bash
+# Run with checkpoint saving
+python run_erm_with_checkpoints.py
+
+# Demo resume functionality  
+python run_erm_with_checkpoints.py --demo_resume
 ```
 
 ## Method Details
@@ -116,7 +171,9 @@ All methods identify 6 spurious correlation groups based on label + negation pre
 ├── just_train_twice.py           # Just Train Twice method
 ├── self_adaptive_training.py     # SELF adaptive training method
 ├── compare_methods.py            # Compare all methods
+├── checkpoint_utils.py           # Checkpoint management utilities
 ├── run_erm_baseline.py          # ERM execution script
+├── run_erm_with_checkpoints.py  # ERM with checkpoint demo
 ├── requirements.txt             # Python dependencies
 └── README.md                   # This file
 ```

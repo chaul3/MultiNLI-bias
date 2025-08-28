@@ -23,6 +23,7 @@ from tqdm import tqdm
 import argparse
 import os
 import json
+from checkpoint_utils import CheckpointManager, find_latest_checkpoint
 
 class MultiNLIDataset(torch.utils.data.Dataset):
     def __init__(self, texts, labels, tokenizer, max_length=256):  # Reduced from 512 for speed
@@ -110,13 +111,22 @@ def load_multinli_data():
     return (train_texts, train_labels, train_groups), (val_texts, val_labels, val_groups)
 
 class ERMTrainer:
-    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4):
+    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
         self.weight_decay = weight_decay
+        
+        # Initialize checkpoint manager if save_dir provided
+        self.checkpoint_manager = None
+        if save_dir:
+            self.checkpoint_manager = CheckpointManager(
+                save_dir=os.path.join(save_dir, 'checkpoints'),
+                model_name='erm_model',
+                save_best_only=True  # Only save when worst-group accuracy improves
+            )
         
     def train(self, train_data, val_data, num_epochs=5):
         """
@@ -202,6 +212,24 @@ class ERMTrainer:
             val_metrics = self.evaluate(val_data)
             print(f"Validation - Overall Acc: {val_metrics['overall_accuracy']:.4f}, "
                   f"Worst Group Acc: {val_metrics['worst_group_accuracy']:.4f}")
+            
+            # Save checkpoint if checkpoint manager is available
+            if self.checkpoint_manager:
+                saved_path = self.checkpoint_manager.save_checkpoint(
+                    epoch=epoch,
+                    model=self.model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    train_loss=avg_loss,
+                    val_metrics=val_metrics,
+                    extra_info={'method': 'ERM_Baseline'}
+                )
+                if saved_path:
+                    print(f"✅ Checkpoint saved: {os.path.basename(saved_path)}")
+        
+        # Print training summary
+        if self.checkpoint_manager:
+            self.checkpoint_manager.print_training_summary()
     
     def evaluate(self, eval_data):
         """Evaluate model and compute group-wise metrics"""
@@ -266,6 +294,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--save_model', type=str, default='multinli_erm_model', help='Path to save model')
+    parser.add_argument('--resume_from', type=str, default=None, help='Resume training from checkpoint')
+    parser.add_argument('--save_checkpoints', action='store_true', help='Enable checkpoint saving')
     
     args = parser.parse_args()
     
@@ -305,22 +335,62 @@ def main():
     )
     model.to(device)
     
-    # Initialize trainer
+    # Initialize trainer with checkpoint support if enabled
+    save_dir = args.save_model if args.save_checkpoints else None
     trainer = ERMTrainer(
         model=model,
         tokenizer=tokenizer,
         device=device,
         lr=args.lr,
         batch_size=args.batch_size,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        save_dir=save_dir
     )
     
+    # Handle resume from checkpoint
+    start_epoch = 0
+    if args.resume_from:
+        print(f"\n📂 Resuming from checkpoint: {args.resume_from}")
+        # Create dummy optimizer and scheduler for loading
+        from torch.optim import AdamW
+        from transformers import get_linear_schedule_with_warmup
+        
+        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        total_steps = len(train_data[0]) // args.batch_size * args.epochs
+        scheduler = get_linear_schedule_with_warmup(optimizer, 0, total_steps)
+        
+        checkpoint_info = trainer.checkpoint_manager.load_checkpoint(
+            args.resume_from, model, optimizer, scheduler
+        )
+        start_epoch = checkpoint_info['epoch'] + 1
+        print(f"✅ Resuming from epoch {start_epoch}")
+    
     # Train model
-    print("\nStarting ERM training...")
-    trainer.train(train_data, val_data, num_epochs=args.epochs)
+    if start_epoch < args.epochs:
+        print(f"\nStarting ERM training from epoch {start_epoch}...")
+        trainer.train(train_data, val_data, num_epochs=args.epochs)
+    else:
+        print("Model already trained to specified epochs!")
+        # Just evaluate
+        final_metrics = trainer.evaluate(val_data)
+        print(f"Current performance - Overall Acc: {final_metrics['overall_accuracy']:.4f}, "
+              f"Worst Group Acc: {final_metrics['worst_group_accuracy']:.4f}")
     
     # Final evaluation
     print("\nFinal evaluation on validation set:")
+    
+    # If we have checkpoints, load the best one for final evaluation
+    if trainer.checkpoint_manager:
+        best_checkpoint_path = trainer.checkpoint_manager.get_best_checkpoint_path()
+        if best_checkpoint_path:
+            print(f"📂 Loading best checkpoint for final evaluation...")
+            # Create fresh optimizer/scheduler for loading (not used for evaluation)
+            optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            total_steps = len(train_data[0]) // args.batch_size * args.epochs
+            scheduler = get_linear_schedule_with_warmup(optimizer, 0, total_steps)
+            
+            trainer.checkpoint_manager.load_checkpoint(best_checkpoint_path, model, optimizer, scheduler)
+    
     final_metrics = trainer.evaluate(val_data)
     
     print(f"Overall Accuracy: {final_metrics['overall_accuracy']:.4f}")
@@ -330,12 +400,13 @@ def main():
     for group_id, acc in final_metrics['group_accuracies'].items():
         print(f"Group {group_id}: {acc:.4f}")
     
-    # Save model
+    # Save model (final state)
     model.save_pretrained(args.save_model)
     tokenizer.save_pretrained(args.save_model)
     
-    # Save results
+    # Save results with checkpoint info
     results = {
+        'method': 'ERM_Baseline',
         'overall_accuracy': final_metrics['overall_accuracy'],
         'worst_group_accuracy': final_metrics['worst_group_accuracy'], 
         'group_accuracies': final_metrics['group_accuracies'],
@@ -343,14 +414,25 @@ def main():
             'batch_size': args.batch_size,
             'learning_rate': args.lr,
             'epochs': args.epochs,
-            'weight_decay': args.weight_decay
+            'weight_decay': args.weight_decay,
+            'checkpointing_enabled': args.save_checkpoints
         }
     }
+    
+    # Add checkpoint info if available
+    if trainer.checkpoint_manager:
+        results['best_epoch'] = trainer.checkpoint_manager.best_epoch
+        results['best_worst_group_acc'] = trainer.checkpoint_manager.best_worst_group_acc
+        results['checkpoint_dir'] = trainer.checkpoint_manager.save_dir
     
     with open(f'{args.save_model}_results.json', 'w') as f:
         json.dump(results, f, indent=2)
     
     print(f"\nModel and results saved to {args.save_model}/")
+    
+    if trainer.checkpoint_manager:
+        print(f"💾 Checkpoints saved to: {trainer.checkpoint_manager.save_dir}")
+        print(f"🏆 Best model achieved {trainer.checkpoint_manager.best_worst_group_acc:.4f} worst-group accuracy at epoch {trainer.checkpoint_manager.best_epoch}")
 
 if __name__ == "__main__":
     main()

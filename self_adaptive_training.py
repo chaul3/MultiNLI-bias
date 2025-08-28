@@ -23,13 +23,15 @@ from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 import argparse
 import json
+import os
 from collections import defaultdict, deque
+from checkpoint_utils import CheckpointManager, find_latest_checkpoint
 
 # Import our baseline components
 from multinli_erm_baseline import MultiNLIDataset, identify_spurious_groups, load_multinli_data
 
 class SELFTrainer:
-    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4):
+    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -41,6 +43,15 @@ class SELFTrainer:
         self.loss_history = defaultdict(lambda: deque(maxlen=10))  # Track loss history per example
         self.group_weights = {}  # Adaptive weights per group
         self.example_weights = {}  # Adaptive weights per example
+        
+        # Initialize checkpoint manager if save_dir provided
+        self.checkpoint_manager = None
+        if save_dir:
+            self.checkpoint_manager = CheckpointManager(
+                save_dir=os.path.join(save_dir, 'checkpoints'),
+                model_name='self_model',
+                save_best_only=True  # Only save when worst-group accuracy improves
+            )
         
     def compute_adaptive_weights(self, indices, losses, groups, epoch):
         """Compute adaptive weights based on loss history and group performance"""
@@ -211,6 +222,28 @@ class SELFTrainer:
             print(f"SELF Validation - Overall Acc: {val_metrics['overall_accuracy']:.4f}, "
                   f"Worst Group Acc: {val_metrics['worst_group_accuracy']:.4f}")
             
+            # Save checkpoint if checkpoint manager is available
+            if self.checkpoint_manager:
+                saved_path = self.checkpoint_manager.save_checkpoint(
+                    epoch=epoch,
+                    model=self.model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    train_loss=avg_loss,
+                    val_metrics=val_metrics,
+                    extra_info={
+                        'method': 'SELF', 
+                        'group_weights': dict(self.group_weights),
+                        'num_examples_with_history': len(self.loss_history)
+                    }
+                )
+                if saved_path:
+                    print(f"✅ Checkpoint saved: {os.path.basename(saved_path)}")
+            
+        # Print training summary
+        if self.checkpoint_manager:
+            self.checkpoint_manager.print_training_summary()
+            
         print("SELF training completed!")
     
     def evaluate(self, eval_data):
@@ -276,6 +309,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--save_model', type=str, default='multinli_self_model', help='Path to save model')
+    parser.add_argument('--save_checkpoints', action='store_true', help='Enable checkpoint saving')
+    parser.add_argument('--resume_from', type=str, default=None, help='Resume training from checkpoint')
     
     args = parser.parse_args()
     
@@ -312,14 +347,16 @@ def main():
     )
     model.to(device)
     
-    # Initialize trainer
+    # Initialize trainer with checkpoint support if enabled
+    save_dir = args.save_model if args.save_checkpoints else None
     trainer = SELFTrainer(
         model=model,
         tokenizer=tokenizer,
         device=device,
         lr=args.lr,
         batch_size=args.batch_size,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        save_dir=save_dir
     )
     
     # Train with SELF
