@@ -1,97 +1,184 @@
-# ERM Baseline for MultiNLI Dataset
+# MultiNLI Bias Research - Comprehensive Bias Mitigation Methods
 
-This repository reproduces the **ERM (Empirical Risk Minimization) baseline** from the paper "Deep Feature Reweighting" (Section 6) on the MultiNLI dataset.
+This repository contains implementations of multiple bias mitigation methods for the MultiNLI dataset, including the ERM baseline and three advanced debiasing techniques.
 
-## Paper Details
+## Overview
 
-- **Paper**: Deep Feature Reweighting (arXiv:2204.02937v2)
-- **Section**: 6 (Feature Reweighting Improves Robustness)
-- **Dataset**: MultiNLI (Multi-Genre Natural Language Inference)
-- **Baseline Model**: BERT-base-uncased with standard ERM training
+The implementation focuses on identifying and mitigating spurious correlations in natural language inference tasks, specifically using negation words as bias indicators in the MultiNLI dataset.
 
-## What This Reproduces
+## Methods Implemented
 
-The ERM baseline represents **conventional training without any procedures for improving worst-group accuracies**. This is the standard BERT-based approach that the paper uses as a baseline to compare against their DFR method.
+### 1. ERM Baseline (Empirical Risk Minimization)
+Standard training with cross-entropy loss - serves as the baseline for comparison.
 
-### Exact Paper Specifications:
+### 2. Last Layer Retraining (LLR)
+- Phase 1: Train full model with ERM
+- Phase 2: Freeze BERT encoder, retrain only classifier with group-balanced sampling
 
-- **Model**: `BertForSequenceClassification.from_pretrained('bert-base-uncased')`
-- **Pre-training**: Book Corpus and English Wikipedia data
-- **Optimizer**: AdamW with linear learning rate annealing
-- **Learning rate**: 1e-5
-- **Batch size**: 16
-- **Weight decay**: 1e-4
-- **Epochs**: 5
-- **No early stopping**
+### 3. Just Train Twice (JTT)
+- Phase 1: Train with ERM to identify worst-performing examples
+- Phase 2: Retrain from scratch with upweighting of worst examples
 
-### Spurious Correlations in MultiNLI:
+### 4. SELF (Self-adaptive Training)
+- Adaptive loss weighting during training
+- Dynamic reweighting based on loss trends and group performance
+- Focus on improving worst-performing groups
 
-The MultiNLI dataset has spurious correlations where negation words ("no", "never", etc.) are correlated with the contradiction class. The model learns to rely on these spurious features, leading to poor worst-group accuracy.
+## Features
 
-## Setup
+- **BERT-base-uncased** foundation model
+- **Spurious correlation detection** based on negation words
+- **Group-wise evaluation** for bias analysis
+- **Apple Silicon (MPS) GPU support** for faster training
+- **Comprehensive comparison** of all methods
 
-### 1. Install Dependencies
+## Quick Start
+
+### Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Download Dataset
+### Run Individual Methods
 
-The script automatically downloads the MultiNLI dataset from HuggingFace Datasets:
-- **No manual download required** - the dataset will be downloaded automatically
-- Training set: ~392K examples
-- Validation set: ~20K examples (validation_matched)
-
-## Usage
-
-### Quick Start (Recommended)
-
+**ERM Baseline:**
 ```bash
-python run_erm_baseline.py
+python multinli_erm_baseline.py --epochs 5
 ```
 
-This runs the ERM baseline with the exact hyperparameters from the paper.
-
-### Manual Run with Custom Parameters
-
+**Last Layer Retraining:**
 ```bash
-python multinli_erm_baseline.py --batch_size 16 --lr 1e-5 --epochs 5 --weight_decay 1e-4
+python last_layer_retraining.py --erm_epochs 3 --llr_epochs 5
 ```
 
-### Available Arguments
+**Just Train Twice:**
+```bash
+python just_train_twice.py --phase1_epochs 3 --phase2_epochs 5 --worst_fraction 0.2
+```
 
-- `--batch_size`: Batch size (default: 16)
-- `--lr`: Learning rate (default: 1e-5)
-- `--epochs`: Number of epochs (default: 5)
-- `--weight_decay`: Weight decay (default: 1e-4)
-- `--save_model`: Path to save model (default: 'multinli_erm_model')
+**SELF (Self-adaptive Training):**
+```bash
+python self_adaptive_training.py --epochs 5
+```
 
-## Expected Results
+### Compare All Methods
 
-Based on the paper, the ERM baseline should achieve:
-- **Overall accuracy**: ~80-85%
-- **Worst group accuracy**: ~65-75% (significantly lower due to spurious correlations)
+**Run all methods and compare (takes several hours):**
+```bash
+python compare_methods.py --run_all --epochs 3
+```
 
-The model will show poor performance on minority groups where the spurious correlation doesn't hold (e.g., contradictions without negation words).
+**Compare existing results only:**
+```bash
+python compare_methods.py --compare_only
+```
 
-## Group Definitions
+## Method Details
 
-The code identifies 6 groups based on label and negation presence:
-- **Group 0**: Contradiction without negation (minority group)
-- **Group 1**: Contradiction with negation (majority group)
-- **Group 2**: Entailment without negation
-- **Group 3**: Entailment with negation
-- **Group 4**: Neutral without negation
-- **Group 5**: Neutral with negation
+### Spurious Groups
+All methods identify 6 spurious correlation groups based on label + negation presence:
+- **contradiction+no_negation**: Contradiction without negation words
+- **contradiction+negation**: Contradiction with negation words  
+- **entailment+no_negation**: Entailment without negation words
+- **entailment+negation**: Entailment with negation words
+- **neutral+no_negation**: Neutral without negation words
+- **neutral+negation**: Neutral with negation words
 
-## Output Files
+### Hyperparameters
+- **Learning rate**: 1e-5 (10x higher for LLR classifier phase)
+- **Batch size**: 16
+- **Weight decay**: 1e-4
+- **Optimizer**: AdamW with linear learning rate schedule
 
-After training, the following files will be created:
-- `multinli_erm_baseline_model/`: Trained BERT model and tokenizer
-- `multinli_erm_baseline_model_results.json`: Detailed results including group-wise accuracies
+## Expected Performance
+
+| Method | Overall Accuracy | Worst Group Accuracy | Improvement over ERM |
+|--------|------------------|---------------------|---------------------|
+| ERM Baseline | ~80-85% | ~65-75% | baseline |
+| Last Layer Retraining | ~80-85% | ~70-80% | +5-10% |
+| Just Train Twice | ~75-85% | ~70-80% | +5-10% |
+| SELF | ~80-85% | ~70-85% | +5-15% |
+
+*Note: Actual results may vary based on random initialization and exact hyperparameters*
 
 ## Hardware Requirements
+
+- **Recommended**: Apple Silicon Mac (M1/M2) with MPS support
+- **Alternative**: NVIDIA GPU with CUDA support  
+- **Minimum**: CPU (significantly slower)
+
+## File Structure
+
+```
+├── multinli_erm_baseline.py      # ERM baseline implementation
+├── last_layer_retraining.py      # Last Layer Retraining method
+├── just_train_twice.py           # Just Train Twice method
+├── self_adaptive_training.py     # SELF adaptive training method
+├── compare_methods.py            # Compare all methods
+├── run_erm_baseline.py          # ERM execution script
+├── requirements.txt             # Python dependencies
+└── README.md                   # This file
+```
+
+## Dependencies
+
+- torch >= 2.0.0 (with MPS support for Apple Silicon)
+- transformers >= 4.20.0
+- datasets >= 2.0.0
+- scikit-learn >= 1.0.0
+- numpy >= 1.20.0
+- pandas >= 1.3.0
+- tqdm >= 4.60.0
+
+## Usage Examples
+
+### Custom Training Parameters
+
+```bash
+# ERM with custom parameters
+python multinli_erm_baseline.py --batch_size 32 --lr 2e-5 --epochs 3
+
+# LLR with longer retraining phase
+python last_layer_retraining.py --erm_epochs 2 --llr_epochs 8
+
+# JTT with higher upweighting
+python just_train_twice.py --upweight_factor 20.0 --worst_fraction 0.3
+
+# SELF with custom parameters
+python self_adaptive_training.py --epochs 8 --lr 1e-5
+```
+
+### Batch Comparison
+
+```bash
+# Quick comparison with reduced epochs
+python compare_methods.py --run_all --epochs 2 --batch_size 32
+```
+
+## Results Analysis
+
+Each method saves detailed results including:
+- Overall accuracy
+- Worst group accuracy  
+- Per-group accuracies
+- Training hyperparameters
+- Method-specific metrics
+
+Results are saved as JSON files and can be compared using the comparison script.
+
+## Citation
+
+If you use this implementation, please cite the original paper:
+
+```bibtex
+@article{kirichenko2022deep,
+  title={Deep Feature Reweighting},
+  author={Kirichenko, Polina and others},
+  journal={arXiv preprint arXiv:2204.02937v2},
+  year={2022}
+}
+```
 
 - **GPU**: Recommended (CUDA-compatible)
 - **RAM**: 8GB+ recommended

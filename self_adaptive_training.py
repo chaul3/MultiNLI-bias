@@ -1,9 +1,12 @@
 """
-ERM Baseline for MultiNLI Dataset
-Reproduces the baseline method from "Deep Feature Reweighting" paper (Section 6)
+SELF (Self-adaptive Training) for MultiNLI Dataset
+A bias mitigation method that adaptively reweights examples during training
+based on their difficulty and group membership to improve worst-group performance.
 
-This implements standard Empirical Risk Minimization (ERM) using BERT-base-uncased
-on the MultiNLI dataset with spurious correlations based on negation words.
+This method:
+1. Trains with adaptive loss weighting
+2. Dynamically reweights examples based on their loss trends
+3. Focuses on improving worst-performing groups
 """
 
 import torch
@@ -15,101 +18,17 @@ from transformers import (
     get_linear_schedule_with_warmup
 )
 from torch.optim import AdamW
-from datasets import load_dataset
 import numpy as np
-import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 import argparse
-import os
 import json
+from collections import defaultdict, deque
 
-class MultiNLIDataset(torch.utils.data.Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=256):  # Reduced from 512 for speed
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        premise, hypothesis = self.texts[idx]
-        
-        # Tokenize the premise and hypothesis pair
-        encoding = self.tokenizer(
-            premise,
-            hypothesis,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(self.labels[idx], dtype=torch.long)
-        }
+# Import our baseline components
+from multinli_erm_baseline import MultiNLIDataset, identify_spurious_groups, load_multinli_data
 
-def identify_spurious_groups(examples):
-    """
-    Identify spurious correlation groups based on negation words
-    Following the paper's methodology for MultiNLI
-    """
-    # Negation words that are spuriously correlated with contradiction
-    negation_words = [
-        'no', 'not', 'never', 'none', 'nothing', 'nowhere', 'nobody', 
-        'neither', 'nor', 'without', "n't", "don't", "won't", "can't",
-        "couldn't", "shouldn't", "wouldn't", "isn't", "aren't", "wasn't", "weren't"
-    ]
-    
-    groups = []
-    
-    for premise, hypothesis, label in zip(examples['premise'], examples['hypothesis'], examples['label']):
-        # Check if hypothesis contains negation words
-        hypothesis_lower = hypothesis.lower()
-        has_negation = any(neg_word in hypothesis_lower for neg_word in negation_words)
-        
-        # Group definition based on label and negation presence
-        if label == 0 and not has_negation:  # contradiction without negation
-            group = "contradiction+no_negation"
-        elif label == 0 and has_negation:    # contradiction with negation  
-            group = "contradiction+negation"
-        elif label == 1 and not has_negation:  # entailment without negation
-            group = "entailment+no_negation"
-        elif label == 1 and has_negation:    # entailment with negation
-            group = "entailment+negation"
-        else:  # neutral cases
-            group = "neutral+no_negation" if not has_negation else "neutral+negation"
-            
-        groups.append(group)
-    
-    return groups
-
-def load_multinli_data():
-    """Load and preprocess MultiNLI dataset"""
-    print("Loading MultiNLI dataset...")
-    
-    # Load dataset from HuggingFace
-    dataset = load_dataset("multi_nli")
-    
-    # Process training data
-    train_texts = list(zip(dataset['train']['premise'], dataset['train']['hypothesis']))
-    train_labels = dataset['train']['label']
-    train_groups = identify_spurious_groups(dataset['train'])
-    
-    # Process validation data  
-    val_texts = list(zip(dataset['validation_matched']['premise'], dataset['validation_matched']['hypothesis']))
-    val_labels = dataset['validation_matched']['label']
-    val_groups = identify_spurious_groups(dataset['validation_matched'])
-    
-    return (train_texts, train_labels, train_groups), (val_texts, val_labels, val_groups)
-
-class ERMTrainer:
+class SELFTrainer:
     def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4):
         self.model = model
         self.tokenizer = tokenizer
@@ -118,90 +37,181 @@ class ERMTrainer:
         self.batch_size = batch_size
         self.weight_decay = weight_decay
         
+        # SELF-specific parameters
+        self.loss_history = defaultdict(lambda: deque(maxlen=10))  # Track loss history per example
+        self.group_weights = {}  # Adaptive weights per group
+        self.example_weights = {}  # Adaptive weights per example
+        
+    def compute_adaptive_weights(self, indices, losses, groups, epoch):
+        """Compute adaptive weights based on loss history and group performance"""
+        
+        # Update loss history for each example
+        for idx, loss, group in zip(indices, losses, groups):
+            self.loss_history[idx].append(loss)
+        
+        # Compute group-level statistics
+        group_losses = defaultdict(list)
+        for idx, loss, group in zip(indices, losses, groups):
+            group_losses[group].append(loss)
+        
+        # Update group weights (inverse of group performance)
+        for group, losses_list in group_losses.items():
+            avg_loss = np.mean(losses_list)
+            self.group_weights[group] = avg_loss  # Higher loss = higher weight
+        
+        # Normalize group weights
+        if self.group_weights:
+            max_weight = max(self.group_weights.values())
+            self.group_weights = {k: v / max_weight for k, v in self.group_weights.items()}
+        
+        # Compute example-level weights
+        example_weights = []
+        for idx, group in zip(indices, groups):
+            # Base weight from group
+            group_weight = self.group_weights.get(group, 1.0)
+            
+            # Example-specific weight based on loss trend
+            if len(self.loss_history[idx]) > 1:
+                # If loss is increasing (difficult example), increase weight
+                recent_loss = np.mean(list(self.loss_history[idx])[-3:])
+                early_loss = np.mean(list(self.loss_history[idx])[:3])
+                
+                if recent_loss > early_loss:
+                    example_weight = 1.5  # Upweight difficult examples
+                else:
+                    example_weight = 1.0
+            else:
+                example_weight = 1.0
+            
+            # Combine group and example weights
+            final_weight = group_weight * example_weight
+            example_weights.append(final_weight)
+            self.example_weights[idx] = final_weight
+        
+        return torch.tensor(example_weights, device=self.device)
+    
+    def weighted_loss(self, logits, labels, weights):
+        """Compute weighted cross-entropy loss"""
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        losses = loss_fct(logits, labels)
+        
+        # Apply weights
+        weighted_losses = losses * weights
+        return weighted_losses.mean()
+    
     def train(self, train_data, val_data, num_epochs=5):
-        """
-        Train the BERT model using ERM (standard training)
-        Following the paper's hyperparameters:
-        - AdamW optimizer
-        - Learning rate: 1e-5
-        - Batch size: 16 
-        - Weight decay: 1e-4
-        - 5 epochs
-        - Linear learning rate annealing
-        """
+        """Train with SELF adaptive weighting"""
+        print("Starting SELF Training with adaptive weighting...")
+        
         train_texts, train_labels, train_groups = train_data
-        val_texts, val_labels, val_groups = val_data
         
-        # Create datasets
+        # Create datasets and loaders
         train_dataset = MultiNLIDataset(train_texts, train_labels, self.tokenizer)
-        val_dataset = MultiNLIDataset(val_texts, val_labels, self.tokenizer)
-        
-        # Create data loaders with optimized settings
         train_loader = DataLoader(
             train_dataset, 
             batch_size=self.batch_size, 
             shuffle=True,
-            num_workers=2,  # Parallel data loading
-            pin_memory=True  # Faster GPU transfer
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False,
             num_workers=2,
             pin_memory=True
         )
         
-        # Setup optimizer and scheduler
+        # Setup optimizer
         optimizer = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         
         total_steps = len(train_loader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=0,
+            num_warmup_steps=int(0.1 * total_steps),  # Warmup for 10% of steps
             num_training_steps=total_steps
         )
         
-        # Training loop
         self.model.train()
         
         for epoch in range(num_epochs):
-            print(f"Epoch {epoch + 1}/{num_epochs}")
+            print(f"SELF Epoch {epoch + 1}/{num_epochs}")
             
             total_loss = 0
-            progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
+            total_weighted_loss = 0
+            progress_bar = tqdm(train_loader, desc=f"SELF Training Epoch {epoch + 1}")
             
-            for batch in progress_bar:
-                # Move batch to device
+            batch_start_idx = 0
+            
+            for batch_idx, batch in enumerate(progress_bar):
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['label'].to(self.device)
                 
+                # Get batch indices and groups
+                batch_size = input_ids.size(0)
+                batch_indices = list(range(batch_start_idx, batch_start_idx + batch_size))
+                batch_groups = [train_groups[i] for i in batch_indices]
+                batch_start_idx += batch_size
+                
                 # Forward pass
                 outputs = self.model(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
+                    attention_mask=attention_mask
                 )
                 
-                loss = outputs.loss
+                # Compute individual losses
+                loss_fct = nn.CrossEntropyLoss(reduction='none')
+                individual_losses = loss_fct(outputs.logits, labels)
+                
+                # Compute adaptive weights
+                if epoch > 0:  # Start adaptive weighting from epoch 1
+                    weights = self.compute_adaptive_weights(
+                        batch_indices, 
+                        individual_losses.detach().cpu().numpy(),
+                        batch_groups,
+                        epoch
+                    )
+                    
+                    # Use weighted loss
+                    loss = self.weighted_loss(outputs.logits, labels, weights)
+                    total_weighted_loss += loss.item()
+                else:
+                    # Standard loss for first epoch
+                    loss = individual_losses.mean()
+                    # Still update loss history
+                    for idx, l in zip(batch_indices, individual_losses.detach().cpu().numpy()):
+                        self.loss_history[idx].append(l)
+                
                 total_loss += loss.item()
                 
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 scheduler.step()
                 
-                progress_bar.set_postfix({'loss': loss.item()})
+                progress_bar.set_postfix({
+                    'loss': loss.item(),
+                    'lr': scheduler.get_last_lr()[0]
+                })
             
             avg_loss = total_loss / len(train_loader)
-            print(f"Average training loss: {avg_loss:.4f}")
+            print(f"SELF Average training loss: {avg_loss:.4f}")
+            
+            if epoch > 0:
+                avg_weighted_loss = total_weighted_loss / len(train_loader)
+                print(f"SELF Average weighted loss: {avg_weighted_loss:.4f}")
+            
+            # Print group weights
+            if self.group_weights:
+                print("Current group weights:")
+                for group, weight in sorted(self.group_weights.items()):
+                    print(f"  {group}: {weight:.3f}")
             
             # Validation
             val_metrics = self.evaluate(val_data)
-            print(f"Validation - Overall Acc: {val_metrics['overall_accuracy']:.4f}, "
+            print(f"SELF Validation - Overall Acc: {val_metrics['overall_accuracy']:.4f}, "
                   f"Worst Group Acc: {val_metrics['worst_group_accuracy']:.4f}")
+            
+        print("SELF training completed!")
     
     def evaluate(self, eval_data):
         """Evaluate model and compute group-wise metrics"""
@@ -260,16 +270,16 @@ class ERMTrainer:
         }
 
 def main():
-    parser = argparse.ArgumentParser(description='ERM Baseline for MultiNLI')
+    parser = argparse.ArgumentParser(description='SELF (Self-adaptive Training) for MultiNLI')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
-    parser.add_argument('--save_model', type=str, default='multinli_erm_model', help='Path to save model')
+    parser.add_argument('--save_model', type=str, default='multinli_self_model', help='Path to save model')
     
     args = parser.parse_args()
     
-    # Setup device - prioritize MPS (Apple Silicon) over CPU
+    # Setup device
     if torch.backends.mps.is_available():
         device = torch.device('mps')
         print(f"Using device: {device} (Apple Silicon GPU)")
@@ -279,7 +289,6 @@ def main():
     else:
         device = torch.device('cpu')
         print(f"Using device: {device} (CPU only)")
-    print(f"PyTorch version: {torch.__version__}")
     
     # Load data
     train_data, val_data = load_multinli_data()
@@ -288,8 +297,6 @@ def main():
     
     # Print group statistics
     train_groups = train_data[2]
-    val_groups = val_data[2]
-    
     print("\nTraining group distribution:")
     for group_id in sorted(set(train_groups)):
         count = train_groups.count(group_id)
@@ -301,12 +308,12 @@ def main():
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     model = BertForSequenceClassification.from_pretrained(
         'bert-base-uncased',
-        num_labels=3  # contradiction, entailment, neutral
+        num_labels=3
     )
     model.to(device)
     
     # Initialize trainer
-    trainer = ERMTrainer(
+    trainer = SELFTrainer(
         model=model,
         tokenizer=tokenizer,
         device=device,
@@ -315,8 +322,7 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    # Train model
-    print("\nStarting ERM training...")
+    # Train with SELF
     trainer.train(train_data, val_data, num_epochs=args.epochs)
     
     # Final evaluation
@@ -330,12 +336,12 @@ def main():
     for group_id, acc in final_metrics['group_accuracies'].items():
         print(f"Group {group_id}: {acc:.4f}")
     
-    # Save model
+    # Save model and results
     model.save_pretrained(args.save_model)
     tokenizer.save_pretrained(args.save_model)
     
-    # Save results
     results = {
+        'method': 'SELF (Self-adaptive Training)',
         'overall_accuracy': final_metrics['overall_accuracy'],
         'worst_group_accuracy': final_metrics['worst_group_accuracy'], 
         'group_accuracies': final_metrics['group_accuracies'],
