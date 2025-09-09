@@ -4,6 +4,12 @@ Reproduces the baseline method from "Deep Feature Reweighting" paper (Section 6)
 
 This implements standard Empirical Risk Minimization (ERM) using BERT-base-uncased
 on the MultiNLI dataset with spurious correlations based on negation words.
+
+Cluster-friendly features:
+- Environment variable support for offline mode
+- Robust error handling for network issues
+- Configurable multiprocessing for DataLoader
+- Memory optimization options
 """
 
 import torch
@@ -23,7 +29,15 @@ from tqdm import tqdm
 import argparse
 import os
 import json
+import warnings
 from checkpoint_utils import CheckpointManager, find_latest_checkpoint
+
+# Set environment variables for cluster compatibility
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
+# Suppress warnings that can clutter cluster logs
+warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 class MultiNLIDataset(torch.utils.data.Dataset):
     def __init__(self, texts, labels, tokenizer, max_length=256):  # Reduced from 512 for speed
@@ -111,13 +125,14 @@ def load_multinli_data():
     return (train_texts, train_labels, train_groups), (val_texts, val_labels, val_groups)
 
 class ERMTrainer:
-    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None):
+    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None, num_workers=0):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
         self.weight_decay = weight_decay
+        self.num_workers = num_workers
         
         # Initialize checkpoint manager if save_dir provided
         self.checkpoint_manager = None
@@ -146,20 +161,20 @@ class ERMTrainer:
         train_dataset = MultiNLIDataset(train_texts, train_labels, self.tokenizer)
         val_dataset = MultiNLIDataset(val_texts, val_labels, self.tokenizer)
         
-        # Create data loaders with optimized settings
+        # Create data loaders with configurable multiprocessing
         train_loader = DataLoader(
             train_dataset, 
             batch_size=self.batch_size, 
             shuffle=True,
-            num_workers=2,  # Parallel data loading
-            pin_memory=True  # Faster GPU transfer
+            num_workers=self.num_workers,
+            pin_memory=True if self.device.type != 'cpu' else False
         )
         val_loader = DataLoader(
             val_dataset, 
             batch_size=self.batch_size, 
             shuffle=False,
-            num_workers=2,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=True if self.device.type != 'cpu' else False
         )
         
         # Setup optimizer and scheduler
@@ -240,8 +255,8 @@ class ERMTrainer:
             eval_dataset, 
             batch_size=self.batch_size, 
             shuffle=False,
-            num_workers=2,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=True if self.device.type != 'cpu' else False
         )
         
         self.model.eval()
@@ -296,25 +311,45 @@ def main():
     parser.add_argument('--save_model', type=str, default='multinli_erm_model', help='Path to save model')
     parser.add_argument('--resume_from', type=str, default=None, help='Resume training from checkpoint')
     parser.add_argument('--save_checkpoints', action='store_true', help='Enable checkpoint saving')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda', 'mps'], 
+                       help='Device to use (auto=automatic detection)')
+    parser.add_argument('--num_workers', type=int, default=0, 
+                       help='Number of DataLoader workers (0=disable multiprocessing, safer for clusters)')
     
     args = parser.parse_args()
     
-    # Setup device - prioritize MPS (Apple Silicon) over CPU
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print(f"Using device: {device} (Apple Silicon GPU)")
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using device: {device} (NVIDIA GPU)")
+    # Setup device with better cluster compatibility
+    if args.device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+            print(f"🖥️  Using device: {device} (Apple Silicon GPU)")
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+            print(f"🖥️  Using device: {device} (NVIDIA GPU)")
+        else:
+            device = torch.device('cpu')
+            print(f"🖥️  Using device: {device} (CPU only)")
     else:
-        device = torch.device('cpu')
-        print(f"Using device: {device} (CPU only)")
-    print(f"PyTorch version: {torch.__version__}")
+        device = torch.device(args.device)
+        print(f"🖥️  Using device: {device} (manually specified)")
     
-    # Load data
-    train_data, val_data = load_multinli_data()
-    print(f"Training samples: {len(train_data[0])}")
-    print(f"Validation samples: {len(val_data[0])}")
+    print(f"🔧 PyTorch version: {torch.__version__}")
+    print(f"⚙️  DataLoader workers: {args.num_workers}")
+    
+    # Check environment variables for cluster settings
+    if os.environ.get('TRANSFORMERS_OFFLINE'):
+        print("🌐 Running in OFFLINE mode (TRANSFORMERS_OFFLINE=1)")
+    
+    # Load data with error handling
+    print("📂 Loading MultiNLI dataset...")
+    try:
+        train_data, val_data = load_multinli_data()
+        print(f"✅ Training samples: {len(train_data[0])}")
+        print(f"✅ Validation samples: {len(val_data[0])}")
+    except Exception as e:
+        print(f"❌ Error loading dataset: {e}")
+        print("💡 Try setting TRANSFORMERS_OFFLINE=0 or check internet connection")
+        return
     
     # Print group statistics
     train_groups = train_data[2]
@@ -326,14 +361,20 @@ def main():
         percentage = 100 * count / len(train_groups)
         print(f"Group {group_id}: {count} samples ({percentage:.1f}%)")
     
-    # Initialize model and tokenizer
-    print("\nInitializing BERT-base-uncased model...")
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertForSequenceClassification.from_pretrained(
-        'bert-base-uncased',
-        num_labels=3  # contradiction, entailment, neutral
-    )
-    model.to(device)
+    # Initialize model and tokenizer with error handling
+    print("\n🤖 Initializing BERT-base-uncased model...")
+    try:
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForSequenceClassification.from_pretrained(
+            'bert-base-uncased',
+            num_labels=3  # contradiction, entailment, neutral
+        )
+        model.to(device)
+        print("✅ Model initialized successfully")
+    except Exception as e:
+        print(f"❌ Error loading BERT model: {e}")
+        print("💡 Check internet connection or set TRANSFORMERS_OFFLINE=1 with pre-downloaded models")
+        return
     
     # Initialize trainer with checkpoint support if enabled
     save_dir = args.save_model if args.save_checkpoints else None
@@ -344,7 +385,8 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         weight_decay=args.weight_decay,
-        save_dir=save_dir
+        save_dir=save_dir,
+        num_workers=args.num_workers
     )
     
     # Handle resume from checkpoint

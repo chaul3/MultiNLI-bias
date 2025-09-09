@@ -7,6 +7,11 @@ This method:
 1. Trains with adaptive loss weighting
 2. Dynamically reweights examples based on their loss trends
 3. Focuses on improving worst-performing groups
+
+Cluster-friendly features:
+- Environment variable support for offline mode
+- Configurable device selection and multiprocessing
+- Robust error handling for network issues
 """
 
 import torch
@@ -21,23 +26,34 @@ from torch.optim import AdamW
 import numpy as np
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
+
+
 import argparse
 import json
 import os
+import warnings
 from collections import defaultdict, deque
 from checkpoint_utils import CheckpointManager, find_latest_checkpoint
+
+# Set environment variables for cluster compatibility
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
+# Suppress warnings that can clutter cluster logs
+warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Import our baseline components
 from multinli_erm_baseline import MultiNLIDataset, identify_spurious_groups, load_multinli_data
 
 class SELFTrainer:
-    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None):
+    def __init__(self, model, tokenizer, device, lr=1e-5, batch_size=16, weight_decay=1e-4, save_dir=None, num_workers=0):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
         self.weight_decay = weight_decay
+        self.num_workers = num_workers
         
         # SELF-specific parameters
         self.loss_history = defaultdict(lambda: deque(maxlen=10))  # Track loss history per example
@@ -116,14 +132,14 @@ class SELFTrainer:
         
         train_texts, train_labels, train_groups = train_data
         
-        # Create datasets and loaders
+        # Create datasets and loaders with configurable multiprocessing
         train_dataset = MultiNLIDataset(train_texts, train_labels, self.tokenizer)
         train_loader = DataLoader(
             train_dataset, 
             batch_size=self.batch_size, 
             shuffle=True,
-            num_workers=2,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=True if self.device.type != 'cpu' else False
         )
         
         # Setup optimizer
@@ -255,8 +271,8 @@ class SELFTrainer:
             eval_dataset, 
             batch_size=self.batch_size, 
             shuffle=False,
-            num_workers=2,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=True if self.device.type != 'cpu' else False
         )
         
         self.model.eval()
@@ -311,19 +327,34 @@ def main():
     parser.add_argument('--save_model', type=str, default='multinli_self_model', help='Path to save model')
     parser.add_argument('--save_checkpoints', action='store_true', help='Enable checkpoint saving')
     parser.add_argument('--resume_from', type=str, default=None, help='Resume training from checkpoint')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda', 'mps'], 
+                       help='Device to use (auto=automatic detection)')
+    parser.add_argument('--num_workers', type=int, default=0, 
+                       help='Number of DataLoader workers (0=disable multiprocessing, safer for clusters)')
     
     args = parser.parse_args()
     
-    # Setup device
-    if torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print(f"Using device: {device} (Apple Silicon GPU)")
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using device: {device} (NVIDIA GPU)")
+    # Setup device with better cluster compatibility
+    if args.device == 'auto':
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+            print(f"🖥️  Using device: {device} (Apple Silicon GPU)")
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+            print(f"🖥️  Using device: {device} (NVIDIA GPU)")
+        else:
+            device = torch.device('cpu')
+            print(f"🖥️  Using device: {device} (CPU only)")
     else:
-        device = torch.device('cpu')
-        print(f"Using device: {device} (CPU only)")
+        device = torch.device(args.device)
+        print(f"🖥️  Using device: {device} (manually specified)")
+    
+    print(f"🔧 PyTorch version: {torch.__version__}")
+    print(f"⚙️  DataLoader workers: {args.num_workers}")
+    
+    # Check environment variables for cluster settings
+    if os.environ.get('TRANSFORMERS_OFFLINE'):
+        print("🌐 Running in OFFLINE mode (TRANSFORMERS_OFFLINE=1)")
     
     # Load data
     train_data, val_data = load_multinli_data()
@@ -356,7 +387,8 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         weight_decay=args.weight_decay,
-        save_dir=save_dir
+        save_dir=save_dir,
+        num_workers=args.num_workers
     )
     
     # Train with SELF

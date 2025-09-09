@@ -86,39 +86,62 @@ python self_adaptive_training.py --epochs 5 --save_checkpoints
 python compare_methods.py --run_all --epochs 3
 ```
 
+**Run with checkpoint saving (recommended):**
+```bash
+python compare_methods.py --run_all --epochs 3 --save_checkpoints
+```
+
+**Disable checkpoint saving:**
+```bash
+python compare_methods.py --run_all --epochs 3 --no_checkpoints
+```
+
 **Compare existing results only:**
 ```bash
 python compare_methods.py --compare_only
 ```
 
-## Checkpoint Functionality
+## Checkpoint System
 
-### Automatic Best Model Saving
-All methods support checkpoint saving that automatically preserves the model with the best worst-group accuracy:
+The codebase includes a comprehensive checkpoint system for preserving the best models based on worst-group accuracy:
 
+### Features
+- **Automatic saving**: Best models saved based on worst-group validation accuracy
+- **Resume capability**: Training can be resumed from any checkpoint
+- **Timestamped directories**: Organized checkpoint storage with timestamps
+- **Method comparison**: Aggregates best checkpoints from all methods
+
+### Individual Method Usage
 ```bash
-# Enable checkpoint saving (saves best model automatically)
-python multinli_erm_baseline.py --save_checkpoints --epochs 10
+# ERM with checkpoints
+python run_erm_with_checkpoints.py --epochs 5 --checkpoint_dir "my_experiment"
 
-# Resume from best checkpoint
-python multinli_erm_baseline.py --resume_from multinli_erm_model/checkpoints/erm_model_best_checkpoint.pt --save_checkpoints
+# SELF-Adaptive Training with checkpoints
+python self_adaptive_training.py --enable_checkpoints --checkpoint_dir "self_experiment"
 ```
 
-### What Gets Saved
-- **Model state**: Complete model weights
-- **Optimizer state**: For exact training resume
-- **Scheduler state**: Learning rate schedule
-- **Training metrics**: Loss and accuracy history
-- **Best performance**: Tracks best worst-group accuracy
-- **Group statistics**: Per-group performance over time
+### Comparison with Checkpoints
+```bash
+# Run all methods and save their best checkpoints
+python compare_methods.py --run_all --epochs 3 --save_checkpoints
 
-### Checkpoint Files
+# This creates a timestamped directory with:
+# - comparison_checkpoints_YYYYMMDD_HHMMSS/
+#   - erm_best_checkpoint.pt
+#   - llr_best_checkpoint.pt  
+#   - jtt_best_checkpoint.pt
+#   - self_best_checkpoint.pt
+#   - comparison_summary.txt
 ```
-model_name/checkpoints/
-├── erm_model_best_checkpoint.pt       # Best model (highest worst-group accuracy)
-├── erm_model_training_history.json    # Training metrics and progress
-└── erm_model_epoch_N_checkpoint.pt    # Periodic checkpoints (if enabled)
-```
+
+### Checkpoint Structure
+Each checkpoint contains:
+- Model state dictionary
+- Optimizer state
+- Learning rate scheduler state
+- Current epoch and step
+- Best validation metrics
+- All configuration parameters
 
 ### Quick Demo
 ```bash
@@ -128,6 +151,68 @@ python run_erm_with_checkpoints.py
 # Demo resume functionality  
 python run_erm_with_checkpoints.py --demo_resume
 ```
+
+## Debugging & Cluster Support
+
+For cluster deployment and debugging issues, see the `debug/` folder:
+
+### Quick Debug Workflow
+```bash
+# 1. Test cluster compatibility
+cd debug/
+python cluster_debug.py
+
+# 2. Create dummy data for testing
+python create_dummy_data.py
+
+# 3. Test with minimal synthetic data
+python cluster_safe_training.py --epochs 1 --batch_size 4
+
+# 4. Test BERT-based pipeline with dummy data
+python debug_erm_baseline.py --epochs 1 --batch_size 4 --save_checkpoints
+```
+
+### Cluster-Ready Main Scripts
+
+All main scripts now include cluster-friendly features:
+
+**Environment Variables:**
+- `TOKENIZERS_PARALLELISM=false` (automatic)
+- `TRANSFORMERS_OFFLINE=1` (set manually for offline mode)
+
+**New Command-Line Options:**
+```bash
+# Device selection
+python multinli_erm_baseline.py --device cpu  # Force CPU
+python multinli_erm_baseline.py --device cuda # Force GPU
+
+# DataLoader safety (disable multiprocessing)
+python multinli_erm_baseline.py --num_workers 0
+
+# Combined cluster-safe command
+python multinli_erm_baseline.py --epochs 1 --batch_size 4 --device cpu --num_workers 0
+```
+
+**Cluster Example Commands:**
+```bash
+# ERM with cluster settings
+python multinli_erm_baseline.py --epochs 3 --device cpu --num_workers 0 --save_checkpoints
+
+# SELF training with cluster settings  
+python self_adaptive_training.py --epochs 3 --device cpu --num_workers 0 --save_checkpoints
+
+# Compare all methods with cluster settings
+python compare_methods.py --run_all --epochs 2 --device cpu --num_workers 0 --save_checkpoints
+```
+
+### Common Cluster Fixes
+- **Network issues**: Set `TRANSFORMERS_OFFLINE=1`
+- **CUDA problems**: Use `--device cpu` 
+- **Memory issues**: Reduce `--batch_size`
+- **Multiprocessing**: Use `--num_workers 0`
+- **Tokenizer warnings**: Automatic (TOKENIZERS_PARALLELISM=false)
+
+See `debug/README.md` and `debug/CLUSTER_SETUP.md` for complete cluster deployment guide.
 
 ## Method Details
 
@@ -174,6 +259,17 @@ All methods identify 6 spurious correlation groups based on label + negation pre
 ├── checkpoint_utils.py           # Checkpoint management utilities
 ├── run_erm_baseline.py          # ERM execution script
 ├── run_erm_with_checkpoints.py  # ERM with checkpoint demo
+├── debug/                       # Debugging tools for cluster issues
+│   ├── cluster_debug.py         # Cluster compatibility tests
+│   ├── create_dummy_data.py     # Generate synthetic test data
+│   ├── cluster_safe_training.py # Simple training without pre-trained models
+│   ├── debug_erm_baseline.py    # Debug ERM with BERT and dummy data
+│   ├── final_validation.py     # Complete debug system validation
+│   ├── test_all_debug.py        # Quick validation of all debug scripts
+│   ├── requirements_debug.txt   # Minimal dependencies for debugging
+│   ├── CLUSTER_SETUP.md        # Step-by-step cluster deployment guide
+│   └── README.md               # Debug documentation
+├── test_cluster_improvements.py # Test cluster features in main scripts
 ├── requirements.txt             # Python dependencies
 └── README.md                   # This file
 ```
